@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+    <color name="sky_black">#FF121212</color>
+    <color name="sky_surface">#FF232323</color>
+    <color name="sky_surface_light">#FF323232</color>
+    <color name="sky_orange">#FFFF7A27</color>
+    <color name="sky_orange_dark">#FFC94E0D</color>
+    <color name="sky_yellow">#FFFFCC4D</color>
+    <color name="sky_text">#FFF7F7F7</color>
+    <color name="sky_muted">#FFB9B9B9</color>
+</resources>
