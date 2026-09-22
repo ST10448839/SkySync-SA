@@ -8,16 +8,11 @@
 
 </p>
 
-<p align="center">
-
-![Android](https://img.shields.io/badge/Platform-Android-brightgreen?style=for-the-badge\&logo=android)
-![Kotlin](https://img.shields.io/badge/Language-Kotlin-purple?style=for-the-badge\&logo=kotlin)
-![Firebase](https://img.shields.io/badge/Backend-Firebase-orange?style=for-the-badge\&logo=firebase)
-![GitHub](https://img.shields.io/badge/Source%20Control-GitHub-black?style=for-the-badge\&logo=github)
-
-</p>
-
 ---
+
+# Link to YouTube demonstration video:
+https://youtu.be/fJMOFESE5r8?si=FWqF464lUsMW8Riy 
+
 
 # 📱 1. Application Overview
 
@@ -551,40 +546,6 @@ Check result
         ↓
 Success ✅ / Failure ❌
 ```
-
-### Example workflow
-
-```yaml
-name: Android Build
-
-on:
-  push:
-    branches:
-      - main
-  pull_request:
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Build Android project
-        run: ./gradlew build
-
-      - name: Run tests
-        run: ./gradlew test
-```
-
-This provides an automated way of checking whether new changes can successfully build and pass the project's tests.
 
 ---
 
