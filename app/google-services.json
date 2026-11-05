@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "113103902253",
+    "project_id": "skysyncsa",
+    "storage_bucket": "skysyncsa.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:113103902253:android:ae40ecda3af4de9c428aa4",
+        "android_client_info": {
+          "package_name": "com.example.skysyncsa"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "113103902253-trhmomgq8mjk46f76ekvegjj38468479.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.example.skysyncsa",
+            "certificate_hash": "f6f00c8854cb2ee116fd53766f01c9285c22f745"
+          }
+        },
+        {
+          "client_id": "113103902253-01l0pp4n38oqmhb397p64gjgm2bniah1.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBhzX1nWTqz_deXEkO2Sjf9x6A6B3ykL2A"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "113103902253-01l0pp4n38oqmhb397p64gjgm2bniah1.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -23,27 +23,42 @@ import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.credentials.Credential
+import androidx.credentials.CredentialManager
+import androidx.credentials.CredentialManagerCallback
+import androidx.credentials.GetCredentialRequest
+import androidx.credentials.exceptions.GetCredentialCancellationException
+import androidx.credentials.exceptions.GetCredentialException
+import com.google.android.libraries.identity.googleid.GetGoogleIdOption
+import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.GoogleAuthProvider
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.messaging.FirebaseMessaging
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
-import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
 
-/** SkySync SA Part 2 prototype with live API, SQLite cache, settings and alerts. */
+/** SkySync SA weather application with live forecasts, offline access, settings and alerts. */
 class MainActivity : AppCompatActivity() {
     private val preferences by lazy { getSharedPreferences("skysync_preferences", Context.MODE_PRIVATE) }
     private val store by lazy { WeatherStore(this) }
+    private val firebaseAuth by lazy { FirebaseAuth.getInstance() }
+    private val firestore by lazy { FirebaseFirestore.getInstance() }
+    private val credentialManager by lazy { CredentialManager.create(this) }
     private val executor = Executors.newSingleThreadExecutor()
     private val connectivityManager by lazy { getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager }
     private lateinit var content: LinearLayout
@@ -65,7 +80,11 @@ class MainActivity : AppCompatActivity() {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 50)
         }
         observeNetwork()
-        if (preferences.getBoolean("signed_in", false)) showHome() else showWelcome()
+        if (firebaseAuth.currentUser != null) {
+            registerNotificationToken()
+            syncPendingSettings()
+            loadCloudSettingsAndShowHome()
+        } else showWelcome()
     }
 
     override fun onDestroy() {
@@ -83,6 +102,7 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             networkCallback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
+                    syncPendingSettings()
                     if (preferences.getBoolean("signed_in", false)) runOnUiThread { showHome() }
                 }
             }
@@ -113,17 +133,171 @@ class MainActivity : AppCompatActivity() {
             when {
                 !android.util.Patterns.EMAIL_ADDRESS.matcher(enteredEmail).matches() -> status.text = t("Enter a valid email address.", "Voer 'n geldige e-posadres in.", "Faka ikheli le-imeyili elivumelekile.")
                 enteredPassword.length < 6 -> status.text = t("Password must have at least 6 characters.", "Wagwoord moet minstens 6 karakters hê.", "Iphasiwedi kufanele ibe nezinhlamvu eziyisi-6.")
-                preferences.getString("password_hash", null) == null -> {
-                    preferences.edit().putString("email", enteredEmail).putString("password_hash", hashPassword(enteredPassword)).putBoolean("signed_in", true).apply(); showHome()
-                }
-                preferences.getString("email", "") == enteredEmail && preferences.getString("password_hash", "") == hashPassword(enteredPassword) -> {
-                    preferences.edit().putBoolean("signed_in", true).apply(); showHome()
-                }
-                else -> status.text = t("Email or password is incorrect.", "E-pos of wagwoord is verkeerd.", "I-imeyili noma iphasiwedi ayilungile.")
+                else -> authenticateWithFirebase(enteredEmail, enteredPassword, status)
             }
         })
+        content.addView(space(12))
+        content.addView(googleButton { continueWithGoogle(status) })
         content.addView(space(10)); content.addView(status); content.addView(space(24))
-        content.addView(label(t("New users are registered automatically. Passwords are stored only as SHA-256 hashes.", "Nuwe gebruikers word outomaties geregistreer. Wagwoorde word slegs as SHA-256-hashtes gestoor.", "Abasebenzisi abasha babhaliswa ngokuzenzakalelayo. Amaphasiwedi agcinwa njenge-SHA-256 hash kuphela.")))
+        content.addView(label(t("New users are registered automatically. Firebase Authentication securely manages passwords; SkySync never saves a password in Firestore.", "Nuwe gebruikers word outomaties geregistreer. Firebase Authentication bestuur wagwoorde veilig; SkySync stoor nooit 'n wagwoord in Firestore nie.", "Abasebenzisi abasha babhaliswa ngokuzenzakalelayo. I-Firebase Authentication iphatha amaphasiwedi ngokuphepha; i-SkySync ayigcini iphasiwedi ku-Firestore.")))
+    }
+
+    /** Starts Google SSO through Credential Manager, then exchanges the ID token with Firebase. */
+    private fun continueWithGoogle(status: TextView) {
+        val clientIdResource = resources.getIdentifier("default_web_client_id", "string", packageName)
+        if (clientIdResource == 0) {
+            status.text = "Google Sign-In still needs Firebase configuration. Download the updated google-services.json after enabling Google in Firebase Authentication."
+            return
+        }
+        val googleOption = GetGoogleIdOption.Builder()
+            .setServerClientId(getString(clientIdResource))
+            .setFilterByAuthorizedAccounts(false)
+            .build()
+        val request = GetCredentialRequest.Builder().addCredentialOption(googleOption).build()
+        status.text = t("Choose a Google account...", "Kies 'n Google-rekening...", "Khetha i-akhawunti ye-Google...")
+        credentialManager.getCredentialAsync(
+            this,
+            request,
+            null,
+            ContextCompat.getMainExecutor(this),
+            object : CredentialManagerCallback<androidx.credentials.GetCredentialResponse, GetCredentialException> {
+                override fun onResult(result: androidx.credentials.GetCredentialResponse) {
+                    authenticateGoogleCredential(result.credential, status)
+                }
+
+                override fun onError(error: GetCredentialException) {
+                    if (error !is GetCredentialCancellationException) {
+                        status.text = error.localizedMessage ?: t("Google sign-in was cancelled or failed.", "Google-aanmelding is gekanselleer of het misluk.", "Ukungena nge-Google kukhanseliwe noma kwehlulekile.")
+                    }
+                }
+            }
+        )
+    }
+
+    private fun authenticateGoogleCredential(credential: Credential, status: TextView) {
+        if (credential.type != GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
+            status.text = t("Google did not return a usable account.", "Google het nie 'n bruikbare rekening teruggestuur nie.", "I-Google ayibuyisanga i-akhawunti esebenzisekayo.")
+            return
+        }
+        try {
+            val token = GoogleIdTokenCredential.createFrom(credential.data).idToken
+            status.text = t("Signing in with Google...", "Meld met Google aan...", "Ingena nge-Google...")
+            firebaseAuth.signInWithCredential(GoogleAuthProvider.getCredential(token, null))
+                .addOnSuccessListener {
+                    val user = firebaseAuth.currentUser ?: return@addOnSuccessListener
+                    val profile = hashMapOf<String, Any>(
+                        "email" to (user.email ?: ""),
+                        "displayName" to (user.displayName ?: ""),
+                        "signInProvider" to "google",
+                        "updatedAt" to System.currentTimeMillis()
+                    )
+                    firestore.collection("users").document(user.uid)
+                        .set(profile, com.google.firebase.firestore.SetOptions.merge())
+                    preferences.edit().putBoolean("signed_in", true).apply()
+                    loadCloudSettingsAndShowHome()
+                }
+                .addOnFailureListener { error ->
+                    status.text = error.localizedMessage ?: t("Google sign-in failed.", "Google-aanmelding het misluk.", "Ukungena nge-Google kwehlulekile.")
+                }
+        } catch (_: Exception) {
+            status.text = t("Google sign-in could not be completed.", "Google-aanmelding kon nie voltooi word nie.", "Ukungena nge-Google akukwazanga ukuqedwa.")
+        }
+    }
+
+    /** Signs in an existing Firebase user; when no usable account exists, creates one. */
+    private fun authenticateWithFirebase(email: String, password: String, status: TextView) {
+        status.text = t("Creating account or signing in...", "Skep rekening of meld aan...", "Yakha i-akhawunti noma iyangena...")
+        firebaseAuth.createUserWithEmailAndPassword(email, password)
+            .addOnSuccessListener {
+                val user = firebaseAuth.currentUser
+                if (user == null) {
+                    status.text = t("Account could not be created.", "Rekening kon nie geskep word nie.", "I-akhawunti ayikwazanga ukudalwa.")
+                    return@addOnSuccessListener
+                }
+                val profile = hashMapOf<String, Any>(
+                    "email" to email,
+                    "defaultLocation" to "Cape Town",
+                    "language" to "English",
+                    "rainAlert" to true,
+                    "severeAlert" to true,
+                    "dailyAlert" to false,
+                    "createdAt" to System.currentTimeMillis()
+                )
+                firestore.collection("users").document(user.uid).set(profile)
+                preferences.edit().putBoolean("signed_in", true).apply()
+                loadCloudSettingsAndShowHome()
+            }
+            .addOnFailureListener {
+                // Existing accounts collide at registration; then this becomes a normal login attempt.
+                firebaseAuth.signInWithEmailAndPassword(email, password)
+                    .addOnSuccessListener {
+                        preferences.edit().putBoolean("signed_in", true).apply()
+                        loadCloudSettingsAndShowHome()
+                    }
+                    .addOnFailureListener { loginError ->
+                        status.text = loginError.localizedMessage
+                            ?: t("Login or registration failed.", "Aanmelding of registrasie het misluk.", "Ukungena noma ukubhalisa kwehlulekile.")
+                    }
+            }
+    }
+
+    /** Loads the signed-in user's remote settings, then opens the app. */
+    private fun loadCloudSettingsAndShowHome() {
+        val user = firebaseAuth.currentUser ?: run { showWelcome(); return }
+        registerNotificationToken()
+        firestore.collection("users").document(user.uid).get()
+            .addOnSuccessListener { document ->
+                if (document.exists()) {
+                    preferences.edit()
+                        .putString("location", document.getString("defaultLocation") ?: "Cape Town")
+                        .putString("language", document.getString("language") ?: "English")
+                        .putBoolean("rain_alert", document.getBoolean("rainAlert") ?: true)
+                        .putBoolean("severe_alert", document.getBoolean("severeAlert") ?: true)
+                        .putBoolean("daily_alert", document.getBoolean("dailyAlert") ?: false)
+                        .putBoolean("signed_in", true)
+                        .apply()
+                }
+                showHome()
+            }
+            .addOnFailureListener {
+                // Offline or temporary Firebase failure: retain locally cached preferences.
+                preferences.edit().putBoolean("signed_in", true).apply()
+                showHome()
+            }
+    }
+
+    private fun saveCloudSettings(location: String, language: String, rainAlert: Boolean, severeAlert: Boolean, dailyAlert: Boolean) {
+        // First save locally so this action works without an internet connection.
+        store.queueSettings(location, language, rainAlert, severeAlert, dailyAlert)
+        syncPendingSettings()
+    }
+
+    /** Registers this device with FCM so alerts can arrive even while SkySync is closed. */
+    private fun registerNotificationToken() {
+        val user = firebaseAuth.currentUser ?: return
+        FirebaseMessaging.getInstance().token.addOnSuccessListener { token ->
+            firestore.collection("users").document(user.uid).set(
+                mapOf("fcmToken" to token, "notificationTokenUpdatedAt" to System.currentTimeMillis()),
+                com.google.firebase.firestore.SetOptions.merge()
+            )
+        }
+    }
+
+    /** Sends the SQLite queue to Firestore after a network connection is available. */
+    private fun syncPendingSettings() {
+        val user = firebaseAuth.currentUser ?: return
+        val pending = store.pendingSettings() ?: return
+        val settings = hashMapOf<String, Any>(
+            "email" to (user.email ?: ""),
+            "defaultLocation" to pending.location,
+            "language" to pending.language,
+            "rainAlert" to pending.rainAlert,
+            "severeAlert" to pending.severeAlert,
+            "dailyAlert" to pending.dailyAlert,
+            "updatedAt" to System.currentTimeMillis()
+        )
+        firestore.collection("users").document(user.uid).set(settings, com.google.firebase.firestore.SetOptions.merge())
+            .addOnSuccessListener { store.clearPendingSettings() }
     }
 
     private fun showHome() {
@@ -168,18 +342,24 @@ class MainActivity : AppCompatActivity() {
         val severe = check(t("Severe-weather alerts", "Ernstige weer waarskuwings", "Izaziso zesimo sezulu esibi"), "severe_alert", true)
         val daily = check(t("Daily morning forecast", "Daaglikse oggend voorspelling", "Isibikezelo sasekuseni sansuku zonke"), "daily_alert", false)
         val saved = label("")
+        val syncState = label("")
         fun updateSaved() { saved.text = "${t("Saved locations", "Gestoorde liggings", "Izindawo ezigciniwe")}: ${store.savedLocations().ifEmpty { listOf("-") }.joinToString()}" }
+        syncState.text = if (store.pendingSettings() != null) t("Pending offline changes will sync when online.", "Wagende vanlyn veranderinge sal sinchroniseer wanneer jy aanlyn is.", "Izinguquko ezingaxhunyiwe zizovumelaniswa uma uxhumekile.") else t("Settings are synchronised.", "Instellings is gesinchroniseer.", "Izilungiselelo zivumelanisiwe.")
         updateSaved()
         content.addView(card().apply {
-            addView(headline(t("Language", "Taal", "Ulimi"))); addView(space(8)); addView(language, LinearLayout.LayoutParams(-1, 52.dp)); addView(space(15)); addView(headline(t("Default location", "Verstekligging", "Indawo ezenzakalelayo"))); addView(space(8)); addView(city); addView(space(12)); addView(rain); addView(severe); addView(daily); addView(space(10)); addView(saved)
+            addView(headline(t("Language", "Taal", "Ulimi"))); addView(space(8)); addView(language, LinearLayout.LayoutParams(-1, 52.dp)); addView(space(15)); addView(headline(t("Default location", "Verstekligging", "Indawo ezenzakalelayo"))); addView(space(8)); addView(city); addView(space(12)); addView(rain); addView(severe); addView(daily); addView(space(10)); addView(saved); addView(space(8)); addView(syncState)
         })
         content.addView(space(14)); content.addView(outlineButton(t("Save this location", "Stoor hierdie ligging", "Gcina le ndawo")) { store.saveLocation(city.text.toString()); updateSaved() }); content.addView(space(10))
         content.addView(outlineButton(t("Use current location", "Gebruik huidige ligging", "Sebenzisa indawo yamanje")) { useCurrentLocation() }); content.addView(space(18))
         content.addView(button(t("Apply Changes", "Pas veranderinge toe", "Sebenzisa izinguquko")) {
-            preferences.edit().putString("language", language.selectedItem.toString()).putString("location", city.text.toString().ifBlank { "Cape Town" }).putBoolean("rain_alert", rain.isChecked).putBoolean("severe_alert", severe.isChecked).putBoolean("daily_alert", daily.isChecked).apply()
-            store.saveLocation(city.text.toString()); showHome()
+            val selectedLocation = city.text.toString().ifBlank { "Cape Town" }
+            val selectedLanguage = language.selectedItem.toString()
+            preferences.edit().putString("language", selectedLanguage).putString("location", selectedLocation).putBoolean("rain_alert", rain.isChecked).putBoolean("severe_alert", severe.isChecked).putBoolean("daily_alert", daily.isChecked).apply()
+            store.saveLocation(selectedLocation)
+            saveCloudSettings(selectedLocation, selectedLanguage, rain.isChecked, severe.isChecked, daily.isChecked)
+            showHome()
         })
-        content.addView(space(10)); content.addView(outlineButton(t("Sign Out", "Teken uit", "Phuma")) { preferences.edit().putBoolean("signed_in", false).apply(); showWelcome() })
+        content.addView(space(10)); content.addView(outlineButton(t("Sign Out", "Teken uit", "Phuma")) { firebaseAuth.signOut(); preferences.edit().putBoolean("signed_in", false).apply(); showWelcome() })
     }
 
     private fun useCurrentLocation() {
@@ -237,19 +417,28 @@ class MainActivity : AppCompatActivity() {
 
     private fun sendAlerts(forecast: ForecastDisplay) {
         val today = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
-        if (forecast.rainSoon && preferences.getBoolean("rain_alert", true)) postNotification(t("Rain forecast", "Reënvoorspelling", "Isibikezelo semvula"), t("Rain is likely in the next few hours.", "Reën is waarskynlik in die volgende paar uur.", "Imvula kungenzeka emahoreni ambalwa azayo."))
-        if (forecast.severe && preferences.getBoolean("severe_alert", true)) postNotification(t("Severe weather", "Ernstige weer", "Isimo sezulu esibi"), t("Thunderstorm conditions are forecast.", "Donderstormtoestande word voorspel.", "Kulindeleke izimo zokuduma kwezulu."))
+        if (forecast.rainSoon && preferences.getBoolean("rain_alert", true)) postWeatherAlertOnce("rain", t("Rain forecast", "Reënvoorspelling", "Isibikezelo semvula"), t("Rain is likely in the next few hours.", "Reën is waarskynlik in die volgende paar uur.", "Imvula kungenzeka emahoreni ambalwa azayo."))
+        if (forecast.severe && preferences.getBoolean("severe_alert", true)) postWeatherAlertOnce("severe", t("Severe weather", "Ernstige weer", "Isimo sezulu esibi"), t("Thunderstorm conditions are forecast.", "Donderstormtoestande word voorspel.", "Kulindeleke izimo zokuduma kwezulu."))
         if (preferences.getBoolean("daily_alert", false) && preferences.getString("last_daily_alert", "") != today) { preferences.edit().putString("last_daily_alert", today).apply(); postNotification(t("Daily SkySync forecast", "Daaglikse SkySync-voorspelling", "Isibikezelo sansuku zonke se-SkySync"), forecast.current) }
     }
 
+    /** Prevents duplicate local weather warnings during the same hour. */
+    private fun postWeatherAlertOnce(type: String, title: String, message: String) {
+        val hour = SimpleDateFormat("yyyyMMddHH", Locale.US).format(Date())
+        val preferenceKey = "last_${type}_alert"
+        if (preferences.getString(preferenceKey, "") == hour) return
+        preferences.edit().putString(preferenceKey, hour).apply()
+        postNotification(title, message)
+    }
+
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(NotificationChannel("weather_alerts", "SkySync weather alerts", NotificationManager.IMPORTANCE_DEFAULT))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(NotificationChannel("weather_alerts", "SkySync weather alerts", NotificationManager.IMPORTANCE_HIGH).apply { description = "Real-time weather warnings and forecast updates" })
     }
 
     private fun postNotification(title: String, message: String) {
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) Notification.Builder(this, "weather_alerts") else Notification.Builder(this)
-        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify((System.currentTimeMillis() % 100000).toInt(), builder.setSmallIcon(R.mipmap.ic_launcher).setContentTitle(title).setContentText(message).setAutoCancel(true).build())
+        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify((System.currentTimeMillis() % 100000).toInt(), builder.setSmallIcon(R.mipmap.ic_launcher).setContentTitle(title).setContentText(message).setStyle(Notification.BigTextStyle().bigText(message)).setAutoCancel(true).build())
     }
 
     private fun get(address: String): String { val connection = URL(address).openConnection() as HttpURLConnection; connection.connectTimeout = 10000; connection.readTimeout = 10000; return connection.inputStream.bufferedReader().use { it.readText() }.also { connection.disconnect() } }
@@ -258,6 +447,13 @@ class MainActivity : AppCompatActivity() {
     private fun card() = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(18.dp, 17.dp, 18.dp, 17.dp); background = rounded(surface, 20f) }
     private fun input(hint: String, password: Boolean) = EditText(this).apply { this.hint = hint; setHintTextColor(Color.rgb(105, 105, 105)); setTextColor(Color.rgb(25, 25, 25)); textSize = 16f; setPadding(18.dp, 0, 18.dp, 0); background = rounded(Color.WHITE, 15f); inputType = if (password) InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD else InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS; layoutParams = LinearLayout.LayoutParams(-1, 58.dp) }
     private fun button(label: String, action: () -> Unit) = Button(this).apply { text = label; setTextColor(Color.WHITE); textSize = 16f; isAllCaps = false; background = rounded(orange, 16f); setOnClickListener { action() }; layoutParams = LinearLayout.LayoutParams(-1, 56.dp) }
+    private fun googleButton(action: () -> Unit) = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER; isClickable = true; isFocusable = true
+        background = rounded(Color.WHITE, 16f); setPadding(18.dp, 0, 18.dp, 0); setOnClickListener { action() }
+        addView(ImageView(this@MainActivity).apply { setImageResource(R.drawable.ic_google_g); contentDescription = "Google" }, LinearLayout.LayoutParams(22.dp, 22.dp))
+        addView(TextView(this@MainActivity).apply { text = "  Continue with Google"; setTextColor(Color.rgb(35, 35, 35)); textSize = 16f; setTypeface(typeface, Typeface.BOLD); gravity = Gravity.CENTER_VERTICAL })
+        layoutParams = LinearLayout.LayoutParams(-1, 56.dp)
+    }
     private fun outlineButton(label: String, action: () -> Unit) = Button(this).apply { text = label; setTextColor(orange); textSize = 16f; isAllCaps = false; background = strokeRounded(surface, orange, 16f); setOnClickListener { action() }; layoutParams = LinearLayout.LayoutParams(-1, 54.dp) }
     private fun headline(value: String) = TextView(this).apply { text = value; setTextColor(primaryTextColor); textSize = 19f; setTypeface(typeface, Typeface.BOLD) }
     private fun label(value: String) = TextView(this).apply { text = value; setTextColor(muted); textSize = 14f; setLineSpacing(3f, 1f) }
@@ -268,7 +464,6 @@ class MainActivity : AppCompatActivity() {
     private fun t(english: String, afrikaans: String = english, isiZulu: String = english): String = when (preferences.getString("language", "English")) { "Afrikaans" -> afrikaans; "isiZulu" -> isiZulu; else -> english }
     private val Int.dp get() = (this * resources.displayMetrics.density).toInt()
     private val Float.dp get() = this * resources.displayMetrics.density
-    private fun hashPassword(value: String): String = MessageDigest.getInstance("SHA-256").digest(value.toByteArray()).joinToString("") { "%02x".format(it) }
 }
 
 private data class ForecastDisplay(val location: String, val current: String, val details: String, val hourly: String, val daily: String, val rainSoon: Boolean, val severe: Boolean)
